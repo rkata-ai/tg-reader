@@ -15,7 +15,7 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tg"
-	// "github.com/gotd/td/tg/tgerr" // Комментируем импорт для tgerr.FloodWaitError
+	// "github.com/gotd/td/tg/tgerr" // Удаляем импорт для tgerr.FloodWaitError
 )
 
 // Reader defines the interface for reading messages from Telegram channels.
@@ -138,7 +138,10 @@ func (c *Client) GetLastMessages(ctx context.Context, channel string, limit int)
 	}
 
 	// Получаем сообщения из канала
+	log.Printf("Перед вызовом MessagesGetHistory для GetLastMessages.")
 	historyResult, err := c.client.API().MessagesGetHistory(ctx, request)
+	log.Printf("После вызова MessagesGetHistory для GetLastMessages. Ошибка: %v, Результат: %T", err, historyResult)
+
 	if err != nil {
 		log.Printf("Ошибка при получении истории сообщений: %v", err)
 		return nil, fmt.Errorf("failed to get history for %s: %w", channelName, err)
@@ -240,9 +243,9 @@ func (c *Client) GetMessagesFromDate(ctx context.Context, channel string, startD
 	var allMessages []Message
 	const batchSize = 100 // Максимальное количество сообщений за один запрос
 
-	// Объявляем currentBatchMessages и historyResult здесь, чтобы они были доступны во всей функции.
-	// var currentBatchMessages []tg.MessageClass // Удаляем объявление здесь
-	// var historyResult tg.MessagesMessagesClass // Удаляем объявление здесь
+	// Переменные для пагинации
+	var offsetID int
+	var offsetDate int // Используем 0 для первого запроса, чтобы получить самые новые
 
 	for {
 		select {
@@ -252,55 +255,81 @@ func (c *Client) GetMessagesFromDate(ctx context.Context, channel string, startD
 		}
 
 		request := &tg.MessagesGetHistoryRequest{
-			Peer:       channelPeer,
-			Limit:      batchSize,
-			OffsetDate: int(startDate.Unix()),
+			Peer:  channelPeer,
+			Limit: batchSize,
 		}
 
-		if len(allMessages) > 0 {
-			// Используем OffsetID для пагинации
-			request.OffsetID = int(allMessages[len(allMessages)-1].ID)
+		if offsetID != 0 {
+			request.OffsetID = offsetID
+		}
+		if offsetDate != 0 {
+			request.OffsetDate = offsetDate
 		}
 
-		// Удаляем цикл повторных попыток для FloodWaitError
+		log.Printf("Перед вызовом MessagesGetHistory для GetMessagesFromDate. OffsetDate: %d, OffsetID: %d", request.OffsetDate, request.OffsetID)
 		historyResult, err := c.client.API().MessagesGetHistory(ctx, request)
+		log.Printf("После вызова MessagesGetHistory для GetMessagesFromDate. Ошибка: %v, Результат: %T", err, historyResult)
+
 		if err != nil {
+			// Проверяем на FloodWaitError с нашей собственной реализацией
+			if wait, ok := isFloodWaitError(err); ok {
+				log.Printf("Получена FLOOD_WAIT ошибка. Ожидание %v перед повторной попыткой...", wait)
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				continue // Повторяем запрос
+			}
 			log.Printf("Ошибка при получении истории сообщений для %s: %v", channelName, err)
 			return nil, fmt.Errorf("failed to get history for %s: %w", channelName, err)
 		}
 
-		var currentBatchMessages []tg.MessageClass
-		switch result := historyResult.(type) {
-		case *tg.MessagesMessages:
-			currentBatchMessages = result.Messages
-		case *tg.MessagesChannelMessages:
-			currentBatchMessages = result.Messages
-		default:
-			return nil, fmt.Errorf("unexpected history result type: %T", result)
+		currentBatchMessages, err := extractMessages(historyResult)
+		if err != nil {
+			return nil, err
 		}
 
 		if len(currentBatchMessages) == 0 {
 			break // Больше нет сообщений
 		}
 
+		var foundMessagesOlderThanStartDate bool
 		for _, msg := range currentBatchMessages {
 			parsedMsg, err := c.parseMessage(msg, channelName)
 			if err != nil {
 				log.Printf("Ошибка при парсинге сообщения: %v", err)
 				continue
 			}
+
+			// Если сообщение старше startDate, мы дошли до начала нужного диапазона
 			if parsedMsg.Date.Before(startDate) {
-				// Мы получили сообщения старше startDate, значит, достигли начала диапазона.
-				// Можно прекратить сбор или отфильтровать лишние.
-				// Здесь мы прекращаем сбор, так как OffsetDate уже должен был отфильтровать.
-				// Но эта проверка нужна для надежности, если API вернет сообщения вне OffsetDate.
-				break
+				foundMessagesOlderThanStartDate = true
+				break // Прекращаем обработку текущей пачки, т.к. остальные сообщения будут еще старше
 			}
 			allMessages = append(allMessages, parsedMsg)
 		}
 
-		if len(currentBatchMessages) < batchSize {
-			break // Получили меньше, чем запросили, значит, достигли конца истории
+		// Обновляем offsetID и offsetDate для следующего запроса
+		// Используем данные самого старого сообщения в текущем пакете
+		oldestMsgInBatch := currentBatchMessages[len(currentBatchMessages)-1]
+		parsedOldestMsg, err := c.parseMessage(oldestMsgInBatch, channelName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse oldest message for pagination: %w", err)
+		}
+		offsetID = int(parsedOldestMsg.ID)
+		offsetDate = int(parsedOldestMsg.Date.Unix())
+
+		// Если мы уже нашли сообщения старше startDate, прерываем основной цикл пагинации
+		if foundMessagesOlderThanStartDate {
+			break
+		}
+
+		// Добавляем небольшую задержку после каждого успешного запроса, чтобы избежать FLOOD_WAIT.
+		select {
+		case <-time.After(1 * time.Second):
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 	// Telegram возвращает сообщения от новых к старым.
@@ -331,9 +360,9 @@ func (c *Client) GetMessagesInDateRange(ctx context.Context, channel string, sta
 	var allMessages []Message
 	const batchSize = 100
 
-	// Объявляем currentBatchMessages и historyResult здесь, чтобы они были доступны во всей функции.
-	// var currentBatchMessages []tg.MessageClass // Удаляем объявление здесь
-	// var historyResult tg.MessagesMessagesClass // Удаляем объявление здесь
+	// Переменные для пагинации
+	var offsetID int
+	var offsetDate = int(endDate.Unix()) // Начинаем пагинацию назад с endDate
 
 	for {
 		select {
@@ -343,54 +372,85 @@ func (c *Client) GetMessagesInDateRange(ctx context.Context, channel string, sta
 		}
 
 		request := &tg.MessagesGetHistoryRequest{
-			Peer:       channelPeer,
-			Limit:      batchSize,
-			OffsetDate: int(endDate.Unix()), // Начинаем с конца диапазона
+			Peer:  channelPeer,
+			Limit: batchSize,
 		}
 
-		if len(allMessages) > 0 {
-			request.OffsetID = int(allMessages[len(allMessages)-1].ID)
+		if offsetID != 0 {
+			request.OffsetID = offsetID
 		}
+		request.OffsetDate = offsetDate // Всегда используем OffsetDate для этого режима
 
-		// Удаляем цикл повторных попыток для FloodWaitError
+		log.Printf("Перед вызовом MessagesGetHistory для GetMessagesInDateRange. OffsetDate: %d, OffsetID: %d", request.OffsetDate, request.OffsetID)
 		historyResult, err := c.client.API().MessagesGetHistory(ctx, request)
+		log.Printf("После вызова MessagesGetHistory для GetMessagesInDateRange. Ошибка: %v, Результат: %T", err, historyResult)
+
 		if err != nil {
+			// Проверяем на FloodWaitError с нашей собственной реализацией
+			if wait, ok := isFloodWaitError(err); ok {
+				log.Printf("Получена FLOOD_WAIT ошибка. Ожидание %v перед повторной попыткой...", wait)
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				continue // Повторяем запрос
+			}
 			log.Printf("Ошибка при получении истории сообщений для %s: %v", channelName, err)
 			return nil, fmt.Errorf("failed to get history for %s: %w", channelName, err)
 		}
 
-		var currentBatchMessages []tg.MessageClass
-		switch result := historyResult.(type) {
-		case *tg.MessagesMessages:
-			currentBatchMessages = result.Messages
-		case *tg.MessagesChannelMessages:
-			currentBatchMessages = result.Messages
-		default:
-			return nil, fmt.Errorf("unexpected history result type: %T", result)
+		currentBatchMessages, err := extractMessages(historyResult)
+		if err != nil {
+			return nil, err
 		}
 
 		if len(currentBatchMessages) == 0 {
 			break // Больше нет сообщений
 		}
 
+		var stopPagination bool
 		for _, msg := range currentBatchMessages {
 			parsedMsg, err := c.parseMessage(msg, channelName)
 			if err != nil {
 				log.Printf("Ошибка при парсинге сообщения: %v", err)
 				continue
 			}
-			// Отфильтровываем сообщения, которые выходят за пределы startDate
+
+			// Если сообщение старше startDate, мы дошли до начала нужного диапазона
 			if parsedMsg.Date.Before(startDate) {
-				break // Достигли начала диапазона, прекращаем сбор
+				stopPagination = true
+				break // Прекращаем обработку текущей пачки
 			}
+
+			// Пропускаем сообщения, которые позже endDate (это может произойти из-за OffsetDate)
 			if parsedMsg.Date.After(endDate) {
-				continue // Пропускаем сообщения, которые позже endDate (это может произойти из-за OffsetDate)
+				continue
 			}
+
 			allMessages = append(allMessages, parsedMsg)
 		}
 
-		if len(currentBatchMessages) < batchSize {
-			break // Получили меньше, чем запросили, значит, достигли конца истории
+		// Обновляем offsetID и offsetDate для следующего запроса
+		// Используем данные самого старого сообщения в текущем пакете
+		oldestMsgInBatch := currentBatchMessages[len(currentBatchMessages)-1]
+		parsedOldestMsg, err := c.parseMessage(oldestMsgInBatch, channelName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse oldest message for pagination: %w", err)
+		}
+		offsetID = int(parsedOldestMsg.ID)
+		offsetDate = int(parsedOldestMsg.Date.Unix())
+
+		// Если мы уже нашли сообщения старше startDate, прерываем основной цикл пагинации
+		if stopPagination {
+			break
+		}
+
+		// Добавляем небольшую задержку после каждого успешного запроса, чтобы избежать FLOOD_WAIT.
+		select {
+		case <-time.After(1 * time.Second):
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 	// Telegram возвращает сообщения от новых к старым. Если мы хотим от старых к новым, нужно реверсировать.
@@ -406,17 +466,38 @@ func reverseMessages(messages []Message) {
 }
 
 // extractMessages извлекает сообщения из результата MessagesGetHistory.
-// Удаляем эту функцию полностью.
-// func extractMessages(historyResult tg.MessagesMessagesClass) ([]tg.MessageClass, error) {
-// 	switch result := historyResult.(type) {
-// 	case *tg.MessagesMessages:
-// 		return result.Messages, nil
-// 	case *tg.MessagesChannelMessages:
-// 		return result.Messages, nil
-// 	default:
-// 		return nil, fmt.Errorf("unexpected history result type: %T", result)
-// 	}
-// }
+func extractMessages(historyResult tg.MessagesMessagesClass) ([]tg.MessageClass, error) {
+	switch result := historyResult.(type) {
+	case *tg.MessagesMessages:
+		return result.Messages, nil
+	case *tg.MessagesChannelMessages:
+		return result.Messages, nil
+	default:
+		return nil, fmt.Errorf("unexpected history result type: %T", result)
+	}
+}
+
+// isFloodWaitError проверяет, является ли ошибка FloodWaitError, и извлекает время ожидания.
+func isFloodWaitError(err error) (time.Duration, bool) {
+	if err == nil {
+		return 0, false
+	}
+
+	s := err.Error()
+	if strings.Contains(s, "rpc error code 420: FLOOD_WAIT") {
+		// Пример: "rpc error code 420: FLOOD_WAIT (19)"
+		parts := strings.Split(s, "(")
+		if len(parts) > 1 {
+			waitStr := strings.TrimSuffix(strings.TrimSpace(parts[1]), ")")
+			if seconds, parseErr := strconv.Atoi(waitStr); parseErr == nil {
+				return time.Duration(seconds) * time.Second, true
+			}
+		}
+		// Если не удалось распарсить время, по умолчанию ждем 5 секунд
+		return 5 * time.Second, true
+	}
+	return 0, false
+}
 
 // SubscribeToChannel подписывается на новые сообщения из указанного канала.
 // Возвращает канал Go, куда будут поступать новые сообщения.

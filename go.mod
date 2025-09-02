@@ -1,13 +1,9 @@
 module traiding
 
-go 1.23.3
-
-toolchain go1.24.3
-
-// toolchain go1.24.3 // Удаляем toolchain
+go 1.24.3
 
 require (
-	github.com/gotd/td v0.130.0 // Возвращаем предыдущую версию
+	github.com/gotd/td v0.131.0 // Используем версию, где tgerr существует
 	github.com/spf13/viper v1.18.2
 )
 
@@ -20,7 +16,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.1.0 // indirect
 	github.com/sagikazarmark/locafero v0.4.0 // indirect
 	github.com/sagikazarmark/slog-shim v0.1.0 // indirect
-	// github.com/segmentio/asm v1.2.0 // Удаляем
 	github.com/sourcegraph/conc v0.3.0 // indirect
 	github.com/spf13/afero v1.11.0 // indirect
 	github.com/spf13/cast v1.6.0 // indirect
@@ -56,11 +51,11 @@ require (
 	go.opentelemetry.io/otel/metric v1.37.0 // indirect
 	go.opentelemetry.io/otel/trace v1.37.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
-	golang.org/x/crypto v0.40.0 // indirect
+	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/exp v0.0.0-20230905200255-921286631fa9 // indirect
-	golang.org/x/mod v0.26.0 // indirect
-	golang.org/x/net v0.42.0 // indirect
-	golang.org/x/tools v0.35.0 // indirect
+	golang.org/x/mod v0.27.0 // indirect
+	golang.org/x/net v0.43.0 // indirect
+	golang.org/x/tools v0.36.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
