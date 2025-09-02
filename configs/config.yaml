@@ -1,0 +1,14 @@
+telegram:
+  bot_token: ""  # Можно оставить пустым для MTProto
+  api_id: "ВАШ_API_ID"        # Ваш API ID из my.telegram.org
+  api_hash: "ВАШ_API_HASH"    # Ваш API Hash из my.telegram.org
+  channels:
+    - "channel_name_1"         # Имена каналов без @ (например: "trading_signals")
+    - "channel_name_2"         # Добавьте каналы, которые хотите анализировать
+
+logging:
+  level: "info"
+  format: "text"
+  output: "stdout"
+
+
