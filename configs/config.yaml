@@ -5,10 +5,14 @@ telegram:
   channels:
     - "channel_name_1"         # Имена каналов без @ (например: "trading_signals")
     - "channel_name_2"         # Добавьте каналы, которые хотите анализировать
+  start_date: "2024-01-01" # Дата, с которой начинать загрузку сообщений (YYYY-MM-DD)
 
-logging:
-  level: "info"
-  format: "text"
-  output: "stdout"
+database:
+  host: "localhost"
+  port: 5432
+  user: "postgres"
+  password: "ВАШ_ПАРОЛЬ_БД"
+  dbname: "tg_reader"
+  sslmode: "disable"
 
 

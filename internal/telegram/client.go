@@ -10,26 +10,32 @@ import (
 	"sync"
 	"time"
 
-	"traiding/internal/config"
+	"rkata-ai/tg-reader/internal/config"
+	"rkata-ai/tg-reader/internal/storage"
 
+	"github.com/google/uuid"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tg"
+
 	// "github.com/gotd/td/tg/tgerr" // Удаляем импорт для tgerr.FloodWaitError
+	"database/sql"
+	"encoding/json"
 )
 
 // Reader defines the interface for reading messages from Telegram channels.
 type Reader interface {
-	GetLastMessages(ctx context.Context, channel string, limit int) ([]Message, error)
-	GetMessagesFromDate(ctx context.Context, channel string, startDate time.Time) ([]Message, error)
-	GetMessagesInDateRange(ctx context.Context, channel string, startDate time.Time, endDate time.Time) ([]Message, error)
-	SubscribeToChannel(ctx context.Context, channel string) (<-chan Message, error)
+	GetLastMessages(ctx context.Context, channel string, limit int) error
+	GetMessagesFromDate(ctx context.Context, channel string, startDate time.Time) error
+	GetMessagesInDateRange(ctx context.Context, channel string, startDate time.Time, endDate time.Time) error
+	SubscribeToChannel(ctx context.Context, channel string) (<-chan storage.Message, error)
 	Close() error
 }
 
 type Client struct {
-	client *telegram.Client
-	config config.TelegramConfig
+	client  *telegram.Client
+	config  config.TelegramConfig
+	storage storage.Storage // Добавляем зависимость от хранилища
 
 	// Карта для отслеживания открытых каналов подписки
 	subscriptions sync.Map
@@ -42,17 +48,9 @@ type Client struct {
 	ready chan struct{} // Channel to signal when client is authenticated and ready
 }
 
-type Message struct {
-	ID        int64
-	Text      string
-	Date      time.Time
-	Channel   string
-	Username  string
-	IsForward bool
-	Type      string
-}
+// Удаляем локальную структуру Message, используем storage.Message
 
-func NewClient(cfg config.TelegramConfig) (*Client, error) {
+func NewClient(cfg config.TelegramConfig, store storage.Storage) (*Client, error) {
 	// Проверяем наличие необходимых данных для MTProto
 	if cfg.APIID == "" || cfg.APIHash == "" {
 		return nil, fmt.Errorf("API ID and API Hash are required for MTProto client")
@@ -67,6 +65,7 @@ func NewClient(cfg config.TelegramConfig) (*Client, error) {
 
 	c := &Client{
 		config:        cfg,
+		storage:       store, // Передаем хранилище
 		subscriptions: sync.Map{},
 		channelIDs:    sync.Map{},
 		ready:         make(chan struct{}), // Initialize the ready channel
@@ -108,8 +107,8 @@ func (c *Client) Start(ctx context.Context) error {
 	return nil
 }
 
-// GetLastMessages получает последние сообщения из канала
-func (c *Client) GetLastMessages(ctx context.Context, channel string, limit int) ([]Message, error) {
+// GetLastMessages получает последние сообщения из канала для отладки, не сохраняя их в БД.
+func (c *Client) GetLastMessages(ctx context.Context, channel string, limit int) ([]storage.Message, error) {
 	// Wait for client to be ready
 	select {
 	case <-ctx.Done():
@@ -118,67 +117,50 @@ func (c *Client) GetLastMessages(ctx context.Context, channel string, limit int)
 		// Client is ready, proceed
 	}
 
-	var messages []Message
-
 	channelName := strings.TrimPrefix(channel, "@")
 
-	log.Printf("Начинаем обработку канала: %s", channelName)
+	log.Printf("Режим отладки: Получение последних %d сообщений из канала %s (без сохранения в БД)...", limit, channelName)
 
-	// Получаем информацию о канале и peer
+	// Для GetLastMessages в режиме отладки нам не нужен dbChannel.ID для parseMessage, т.к. не сохраняем в БД. Создадим "пустой" UUID.
+	dummyChannelID := uuid.Nil
+
 	channelPeer, err := c.resolveChannelPeer(ctx, channelName)
 	if err != nil {
 		return nil, err
 	}
-
-	log.Printf("Отправляем запрос на получение истории сообщений...")
 
 	request := &tg.MessagesGetHistoryRequest{
 		Peer:  channelPeer,
 		Limit: limit,
 	}
 
-	// Получаем сообщения из канала
-	log.Printf("Перед вызовом MessagesGetHistory для GetLastMessages.")
 	historyResult, err := c.client.API().MessagesGetHistory(ctx, request)
-	log.Printf("После вызова MessagesGetHistory для GetLastMessages. Ошибка: %v, Результат: %T", err, historyResult)
 
 	if err != nil {
-		log.Printf("Ошибка при получении истории сообщений: %v", err)
+		log.Printf("Ошибка при получении истории сообщений для отладки: %v", err)
 		return nil, fmt.Errorf("failed to get history for %s: %w", channelName, err)
 	}
-	log.Printf("История сообщений успешно получена.")
 
-	// Обрабатываем полученные сообщения
-	switch result := historyResult.(type) {
-	case *tg.MessagesMessages:
-		log.Printf("Получено %d сообщений.", len(result.Messages))
-		for _, msg := range result.Messages {
-			if len(messages) >= limit {
-				break
-			}
-			message, err := c.parseMessage(msg, channelName)
-			if err != nil {
-				log.Printf("Ошибка при парсинге сообщения: %v", err)
-				continue
-			}
-			messages = append(messages, message)
-		}
-	case *tg.MessagesChannelMessages:
-		log.Printf("Получено %d сообщений.", len(result.Messages))
-		for _, msg := range result.Messages {
-			if len(messages) >= limit {
-				break
-			}
-			message, err := c.parseMessage(msg, channelName)
-			if err != nil {
-				log.Printf("Ошибка при парсинге сообщения: %v", err)
-				continue
-			}
-			messages = append(messages, message)
-		}
+	currentBatchTgMessages, err := extractMessages(historyResult)
+	if err != nil {
+		return nil, err
 	}
 
-	return messages, nil
+	var fetchedMessages []storage.Message
+	for _, msg := range currentBatchTgMessages {
+		parsedMsg, err := c.parseMessage(msg, dummyChannelID, channelName)
+		if err != nil {
+			log.Printf("Ошибка при парсинге сообщения для отладки: %v", err)
+			continue
+		}
+		fetchedMessages = append(fetchedMessages, parsedMsg)
+	}
+
+	// Возвращаем сообщения в хронологическом порядке (старые первыми)
+	reverseMessages(fetchedMessages)
+
+	log.Printf("Завершено получение %d сообщений из канала %s.", len(fetchedMessages), channelName)
+	return fetchedMessages, nil
 }
 
 // resolveChannelPeer получает tg.InputPeerClass для заданного имени канала.
@@ -199,8 +181,7 @@ func (c *Client) resolveChannelPeer(ctx context.Context, channelName string) (tg
 	case *tg.PeerChannel:
 		var channel tg.Channel
 		for _, chat := range resolveResult.Chats {
-			ch, ok := chat.(*tg.Channel)
-			if ok && ch.ID == p.ChannelID {
+			if ch, ok := chat.(*tg.Channel); ok && ch.ID == p.ChannelID {
 				channel = *ch
 				break
 			}
@@ -222,12 +203,12 @@ func (c *Client) resolveChannelPeer(ctx context.Context, channelName string) (tg
 	return channelPeer, nil
 }
 
-// GetMessagesFromDate получает сообщения из канала, начиная с указанной даты, до настоящего момента.
-func (c *Client) GetMessagesFromDate(ctx context.Context, channel string, startDate time.Time) ([]Message, error) {
+// GetMessagesFromDate получает сообщения из канала, начиная с указанной даты, до настоящего момента, и сохраняет их в БД.
+func (c *Client) GetMessagesFromDate(ctx context.Context, channel string, startDate time.Time) error {
 	// Wait for client to be ready
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return ctx.Err()
 	case <-c.ready:
 		// Client is ready, proceed
 	}
@@ -235,22 +216,40 @@ func (c *Client) GetMessagesFromDate(ctx context.Context, channel string, startD
 	channelName := strings.TrimPrefix(channel, "@")
 	log.Printf("Начинаем обработку канала %s с %s...", channelName, startDate.Format("2006-01-02"))
 
-	channelPeer, err := c.resolveChannelPeer(ctx, channelName)
+	// 1. Получаем или создаем канал в БД
+	dbChannel, err := c.storage.GetChannelByUsername(ctx, channelName)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to get channel from db: %w", err)
+	}
+	if dbChannel == nil {
+		dbChannel = &storage.Channel{
+			ID:        uuid.New(),
+			Username:  channelName,
+			Title:     sql.NullString{String: channelName, Valid: true},
+			CreatedAt: time.Now(),
+		}
+		if err := c.storage.SaveChannel(ctx, dbChannel); err != nil {
+			return fmt.Errorf("failed to save new channel to db: %w", err)
+		}
 	}
 
-	var allMessages []Message
-	const batchSize = 100 // Максимальное количество сообщений за один запрос
+	channelPeer, err := c.resolveChannelPeer(ctx, channelName)
+	if err != nil {
+		return err
+	}
+
+	var fetchedMessages []storage.Message // Для временного хранения сообщений из пачки перед сохранением
+	const batchSize = 100                 // Максимальное количество сообщений за один запрос
 
 	// Переменные для пагинации
 	var offsetID int
 	var offsetDate int // Используем 0 для первого запроса, чтобы получить самые новые
+	var totalSaved int
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		default:
 		}
 
@@ -266,9 +265,7 @@ func (c *Client) GetMessagesFromDate(ctx context.Context, channel string, startD
 			request.OffsetDate = offsetDate
 		}
 
-		log.Printf("Перед вызовом MessagesGetHistory для GetMessagesFromDate. OffsetDate: %d, OffsetID: %d", request.OffsetDate, request.OffsetID)
 		historyResult, err := c.client.API().MessagesGetHistory(ctx, request)
-		log.Printf("После вызова MessagesGetHistory для GetMessagesFromDate. Ошибка: %v, Результат: %T", err, historyResult)
 
 		if err != nil {
 			// Проверяем на FloodWaitError с нашей собственной реализацией
@@ -277,48 +274,58 @@ func (c *Client) GetMessagesFromDate(ctx context.Context, channel string, startD
 				select {
 				case <-time.After(wait):
 				case <-ctx.Done():
-					return nil, ctx.Err()
+					return ctx.Err()
 				}
 				continue // Повторяем запрос
 			}
 			log.Printf("Ошибка при получении истории сообщений для %s: %v", channelName, err)
-			return nil, fmt.Errorf("failed to get history for %s: %w", channelName, err)
+			return fmt.Errorf("failed to get history for %s: %w", channelName, err)
 		}
 
-		currentBatchMessages, err := extractMessages(historyResult)
+		currentBatchTgMessages, err := extractMessages(historyResult)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
-		if len(currentBatchMessages) == 0 {
+		if len(currentBatchTgMessages) == 0 {
 			break // Больше нет сообщений
 		}
 
+		fetchedMessages = fetchedMessages[:0] // Очищаем слайс для новой пачки
 		var foundMessagesOlderThanStartDate bool
-		for _, msg := range currentBatchMessages {
-			parsedMsg, err := c.parseMessage(msg, channelName)
+		for _, msg := range currentBatchTgMessages {
+			dbMessage, err := c.parseMessage(msg, dbChannel.ID, channelName)
 			if err != nil {
 				log.Printf("Ошибка при парсинге сообщения: %v", err)
 				continue
 			}
 
 			// Если сообщение старше startDate, мы дошли до начала нужного диапазона
-			if parsedMsg.Date.Before(startDate) {
+			if dbMessage.SentAt.Before(startDate) {
 				foundMessagesOlderThanStartDate = true
 				break // Прекращаем обработку текущей пачки, т.к. остальные сообщения будут еще старше
 			}
-			allMessages = append(allMessages, parsedMsg)
+			fetchedMessages = append(fetchedMessages, dbMessage)
+		}
+
+		// Если есть сообщения для сохранения, сохраняем их
+		for _, msgToSave := range fetchedMessages {
+			if err := c.storage.SaveMessage(ctx, &msgToSave); err != nil {
+				log.Printf("Ошибка при сохранении сообщения в БД (GetMessagesFromDate): %v", err)
+				continue
+			}
+			totalSaved++
 		}
 
 		// Обновляем offsetID и offsetDate для следующего запроса
-		// Используем данные самого старого сообщения в текущем пакете
-		oldestMsgInBatch := currentBatchMessages[len(currentBatchMessages)-1]
-		parsedOldestMsg, err := c.parseMessage(oldestMsgInBatch, channelName)
+		// Используем данные самого старого сообщения в текущем пакете из оригинальных TG-сообщений
+		oldestTgMsgInBatch := currentBatchTgMessages[len(currentBatchTgMessages)-1]
+		parsedOldestMsg, err := c.parseMessage(oldestTgMsgInBatch, dbChannel.ID, channelName)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse oldest message for pagination: %w", err)
+			return fmt.Errorf("failed to parse oldest message for pagination: %w", err)
 		}
-		offsetID = int(parsedOldestMsg.ID)
-		offsetDate = int(parsedOldestMsg.Date.Unix())
+		offsetID = int(parsedOldestMsg.TelegramID)
+		offsetDate = int(parsedOldestMsg.SentAt.Unix())
 
 		// Если мы уже нашли сообщения старше startDate, прерываем основной цикл пагинации
 		if foundMessagesOlderThanStartDate {
@@ -329,21 +336,20 @@ func (c *Client) GetMessagesFromDate(ctx context.Context, channel string, startD
 		select {
 		case <-time.After(1 * time.Second):
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
 	}
-	// Telegram возвращает сообщения от новых к старым.
-	// Если мы хотим от старых к новым, нужно реверсировать.
-	reverseMessages(allMessages)
-	return allMessages, nil
+
+	log.Printf("Успешно получено и сохранено %d сообщений из %s, начиная с %s.", totalSaved, channelName, startDate.Format("2006-01-02"))
+	return nil
 }
 
-// GetMessagesInDateRange получает сообщения из канала в заданном диапазоне дат.
-func (c *Client) GetMessagesInDateRange(ctx context.Context, channel string, startDate time.Time, endDate time.Time) ([]Message, error) {
+// GetMessagesInDateRange получает сообщения из канала в заданном диапазоне дат и сохраняет их в БД.
+func (c *Client) GetMessagesInDateRange(ctx context.Context, channel string, startDate time.Time, endDate time.Time) error {
 	// Wait for client to be ready
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return ctx.Err()
 	case <-c.ready:
 		// Client is ready, proceed
 	}
@@ -352,22 +358,40 @@ func (c *Client) GetMessagesInDateRange(ctx context.Context, channel string, sta
 	log.Printf("Начинаем обработку канала %s с %s по %s...",
 		channelName, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
 
-	channelPeer, err := c.resolveChannelPeer(ctx, channelName)
+	// 1. Получаем или создаем канал в БД
+	dbChannel, err := c.storage.GetChannelByUsername(ctx, channelName)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to get channel from db: %w", err)
+	}
+	if dbChannel == nil {
+		dbChannel = &storage.Channel{
+			ID:        uuid.New(),
+			Username:  channelName,
+			Title:     sql.NullString{String: channelName, Valid: true},
+			CreatedAt: time.Now(),
+		}
+		if err := c.storage.SaveChannel(ctx, dbChannel); err != nil {
+			return fmt.Errorf("failed to save new channel to db: %w", err)
+		}
 	}
 
-	var allMessages []Message
+	channelPeer, err := c.resolveChannelPeer(ctx, channelName)
+	if err != nil {
+		return err
+	}
+
+	var fetchedMessages []storage.Message // Для временного хранения сообщений из пачки перед сохранением
 	const batchSize = 100
 
 	// Переменные для пагинации
 	var offsetID int
 	var offsetDate = int(endDate.Unix()) // Начинаем пагинацию назад с endDate
+	var totalSaved int
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		default:
 		}
 
@@ -381,9 +405,7 @@ func (c *Client) GetMessagesInDateRange(ctx context.Context, channel string, sta
 		}
 		request.OffsetDate = offsetDate // Всегда используем OffsetDate для этого режима
 
-		log.Printf("Перед вызовом MessagesGetHistory для GetMessagesInDateRange. OffsetDate: %d, OffsetID: %d", request.OffsetDate, request.OffsetID)
 		historyResult, err := c.client.API().MessagesGetHistory(ctx, request)
-		log.Printf("После вызова MessagesGetHistory для GetMessagesInDateRange. Ошибка: %v, Результат: %T", err, historyResult)
 
 		if err != nil {
 			// Проверяем на FloodWaitError с нашей собственной реализацией
@@ -392,54 +414,64 @@ func (c *Client) GetMessagesInDateRange(ctx context.Context, channel string, sta
 				select {
 				case <-time.After(wait):
 				case <-ctx.Done():
-					return nil, ctx.Err()
+					return ctx.Err()
 				}
 				continue // Повторяем запрос
 			}
 			log.Printf("Ошибка при получении истории сообщений для %s: %v", channelName, err)
-			return nil, fmt.Errorf("failed to get history for %s: %w", channelName, err)
+			return fmt.Errorf("failed to get history for %s: %w", channelName, err)
 		}
 
-		currentBatchMessages, err := extractMessages(historyResult)
+		currentBatchTgMessages, err := extractMessages(historyResult)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
-		if len(currentBatchMessages) == 0 {
+		if len(currentBatchTgMessages) == 0 {
 			break // Больше нет сообщений
 		}
 
+		fetchedMessages = fetchedMessages[:0] // Очищаем слайс для новой пачки
 		var stopPagination bool
-		for _, msg := range currentBatchMessages {
-			parsedMsg, err := c.parseMessage(msg, channelName)
+		for _, msg := range currentBatchTgMessages {
+			dbMessage, err := c.parseMessage(msg, dbChannel.ID, channelName)
 			if err != nil {
 				log.Printf("Ошибка при парсинге сообщения: %v", err)
 				continue
 			}
 
 			// Если сообщение старше startDate, мы дошли до начала нужного диапазона
-			if parsedMsg.Date.Before(startDate) {
+			if dbMessage.SentAt.Before(startDate) {
 				stopPagination = true
 				break // Прекращаем обработку текущей пачки
 			}
 
 			// Пропускаем сообщения, которые позже endDate (это может произойти из-за OffsetDate)
-			if parsedMsg.Date.After(endDate) {
+			if dbMessage.SentAt.After(endDate) {
 				continue
 			}
 
-			allMessages = append(allMessages, parsedMsg)
+			fetchedMessages = append(fetchedMessages, dbMessage)
+		}
+
+		// Если есть сообщения для сохранения, сохраняем их
+		for _, msgToSave := range fetchedMessages {
+			if err := c.storage.SaveMessage(ctx, &msgToSave); err != nil {
+				log.Printf("Ошибка при сохранении сообщения в БД (GetMessagesInDateRange): %v", err)
+				continue
+			}
+			totalSaved++
 		}
 
 		// Обновляем offsetID и offsetDate для следующего запроса
-		// Используем данные самого старого сообщения в текущем пакете
-		oldestMsgInBatch := currentBatchMessages[len(currentBatchMessages)-1]
-		parsedOldestMsg, err := c.parseMessage(oldestMsgInBatch, channelName)
+		// Используем данные самого старого сообщения в текущем пакете из оригинальных TG-сообщений
+		oldestTgMsgInBatch := currentBatchTgMessages[len(currentBatchTgMessages)-1]
+		parsedOldestMsg, err := c.parseMessage(oldestTgMsgInBatch, dbChannel.ID, channelName)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse oldest message for pagination: %w", err)
+			return fmt.Errorf("failed to parse oldest message for pagination: %w", err)
 		}
-		offsetID = int(parsedOldestMsg.ID)
-		offsetDate = int(parsedOldestMsg.Date.Unix())
+		offsetID = int(parsedOldestMsg.TelegramID)
+		offsetDate = int(parsedOldestMsg.SentAt.Unix())
 
 		// Если мы уже нашли сообщения старше startDate, прерываем основной цикл пагинации
 		if stopPagination {
@@ -450,16 +482,17 @@ func (c *Client) GetMessagesInDateRange(ctx context.Context, channel string, sta
 		select {
 		case <-time.After(1 * time.Second):
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
 	}
-	// Telegram возвращает сообщения от новых к старым. Если мы хотим от старых к новым, нужно реверсировать.
-	reverseMessages(allMessages)
-	return allMessages, nil
+
+	log.Printf("Успешно получено и сохранено %d сообщений из %s в диапазоне с %s по %s.",
+		totalSaved, channelName, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+	return nil
 }
 
 // reverseMessages реверсирует порядок сообщений в слайсе.
-func reverseMessages(messages []Message) {
+func reverseMessages(messages []storage.Message) {
 	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
 		messages[i], messages[j] = messages[j], messages[i]
 	}
@@ -500,8 +533,8 @@ func isFloodWaitError(err error) (time.Duration, bool) {
 }
 
 // SubscribeToChannel подписывается на новые сообщения из указанного канала.
-// Возвращает канал Go, куда будут поступать новые сообщения.
-func (c *Client) SubscribeToChannel(ctx context.Context, channelName string) (<-chan Message, error) {
+// Возвращает канал Go, куда будут поступать новые сообщения (сохраняются в БД автоматически).
+func (c *Client) SubscribeToChannel(ctx context.Context, channelName string) (<-chan storage.Message, error) {
 	// Wait for client to be ready
 	select {
 	case <-ctx.Done():
@@ -517,7 +550,7 @@ func (c *Client) SubscribeToChannel(ctx context.Context, channelName string) (<-
 		return nil, fmt.Errorf("уже подписаны на канал: %s", channelName)
 	}
 
-	msgChan := make(chan Message)
+	msgChan := make(chan storage.Message)
 	// Добавляем канал в карту подписок
 	c.subscriptions.Store(channelName, msgChan)
 
@@ -528,6 +561,23 @@ func (c *Client) SubscribeToChannel(ctx context.Context, channelName string) (<-
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve username %s: %w", channelName, err)
+	}
+
+	// 1. Получаем или создаем канал в БД для подписки
+	dbChannel, err := c.storage.GetChannelByUsername(ctx, channelName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get channel from db for subscription: %w", err)
+	}
+	if dbChannel == nil {
+		dbChannel = &storage.Channel{
+			ID:        uuid.New(),
+			Username:  channelName,
+			Title:     sql.NullString{String: channelName, Valid: true},
+			CreatedAt: time.Now(),
+		}
+		if err := c.storage.SaveChannel(ctx, dbChannel); err != nil {
+			return nil, fmt.Errorf("failed to save new channel to db for subscription: %w", err)
+		}
 	}
 
 	switch p := resolveResult.Peer.(type) {
@@ -567,12 +617,30 @@ func (c *Client) handleUpdate(ctx context.Context, updates tg.UpdatesClass) erro
 
 					if targetChannelName != "" {
 						if ch, loaded := c.subscriptions.Load(targetChannelName); loaded {
-							msgChan := ch.(chan Message)
-							parsedMsg, err := c.parseMessage(msg, targetChannelName)
+							msgChan := ch.(chan storage.Message)
+
+							// Получаем ID канала из БД, чтобы передать его в parseMessage
+							dbChannel, err := c.storage.GetChannelByUsername(ctx, targetChannelName)
+							if err != nil {
+								log.Printf("Ошибка получения канала из БД для handleUpdate: %v", err)
+								return nil // Продолжаем обрабатывать другие обновления
+							}
+							if dbChannel == nil {
+								log.Printf("Канал %s не найден в БД при handleUpdate", targetChannelName)
+								return nil
+							}
+							parsedMsg, err := c.parseMessage(msg, dbChannel.ID, targetChannelName)
 							if err != nil {
 								log.Printf("Ошибка парсинга сообщения для подписки: %v", err)
 								return nil
 							}
+
+							// Сохраняем новое сообщение в БД
+							if err := c.storage.SaveMessage(ctx, &parsedMsg); err != nil {
+								log.Printf("Ошибка сохранения нового сообщения из подписки в БД: %v", err)
+								// Продолжаем, даже если не удалось сохранить, чтобы не блокировать поток обновлений
+							}
+
 							select {
 							case msgChan <- parsedMsg:
 							case <-ctx.Done():
@@ -602,34 +670,51 @@ func (c *Client) auth(ctx context.Context) error {
 	return nil
 }
 
-// parseMessage парсит сообщение из MTProto в нашу структуру
-func (c *Client) parseMessage(msg tg.MessageClass, channelName string) (Message, error) {
+// parseMessage парсит сообщение из MTProto в нашу структуру storage.Message
+func (c *Client) parseMessage(msg tg.MessageClass, channelID uuid.UUID, channelName string) (storage.Message, error) {
+	var text string
+	var isForward bool
+	var senderUsername sql.NullString
+	var messageType string
+	var messageDate time.Time
+
+	// Сохраняем оригинальные сырые данные сообщения в JSONB
+	rawData, err := json.Marshal(msg)
+	if err != nil {
+		return storage.Message{}, fmt.Errorf("failed to marshal raw message data: %w", err)
+	}
+
 	switch m := msg.(type) {
 	case *tg.Message:
-		// Проверка на пересланное сообщение
-		isForward := m.FwdFrom.Date != 0
-		return Message{
-			ID:        int64(m.ID),
-			Text:      m.Message,
-			Date:      time.Unix(int64(m.Date), 0),
-			Channel:   channelName,
-			Username:  "",
-			IsForward: isForward,
-			Type:      getMessageType(m),
-		}, nil
+		text = m.Message
+		isForward = m.FwdFrom.Date != 0
+		messageDate = time.Unix(int64(m.Date), 0)
+		messageType = getMessageType(m)
+		// TODO: Извлекать Username отправителя, если это не канал
+		// if m.FromID != nil {
+		// 	// Нужно разрешать Peer (User, Chat) для получения Username
+		// }
 	case *tg.MessageService:
-		return Message{
-			ID:        int64(m.ID),
-			Text:      "Service message",
-			Date:      time.Unix(int64(m.Date), 0),
-			Channel:   channelName,
-			Username:  "",
-			IsForward: false,
-			Type:      "service",
-		}, nil
+		text = "Service message"
+		isForward = false
+		messageDate = time.Unix(int64(m.Date), 0)
+		messageType = "service"
 	default:
-		return Message{}, fmt.Errorf("unknown message type: %T", msg)
+		return storage.Message{}, fmt.Errorf("unknown message type: %T", msg)
 	}
+
+	return storage.Message{
+		ID:             uuid.New(),
+		TelegramID:     int64(msg.GetID()),
+		ChannelID:      channelID,
+		Text:           sql.NullString{String: text, Valid: text != ""},
+		SentAt:         messageDate,
+		SenderUsername: senderUsername,
+		IsForward:      sql.NullBool{Bool: isForward, Valid: true},
+		MessageType:    sql.NullString{String: messageType, Valid: messageType != ""},
+		RawData:        rawData,
+		CreatedAt:      time.Now(),
+	}, nil
 }
 
 // getMessageType определяет тип сообщения
