@@ -30,10 +30,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-require (
-	github.com/google/uuid v1.6.0
-	github.com/lib/pq v1.10.9
-)
+require github.com/lib/pq v1.10.9
 
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
@@ -45,6 +42,7 @@ require (
 	github.com/go-faster/jx v1.1.0 // indirect
 	github.com/go-faster/xor v1.0.0 // indirect
 	github.com/go-faster/yaml v0.4.6 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/gotd/ige v0.2.2 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect

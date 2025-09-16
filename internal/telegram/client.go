@@ -13,7 +13,7 @@ import (
 	"rkata-ai/tg-reader/internal/config"
 	"rkata-ai/tg-reader/internal/storage"
 
-	"github.com/google/uuid"
+	// "github.com/google/uuid"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tg"
@@ -25,7 +25,7 @@ import (
 
 // Reader defines the interface for reading messages from Telegram channels.
 type Reader interface {
-	GetLastMessages(ctx context.Context, channel string, limit int) error
+	GetLastMessages(ctx context.Context, channel string, limit int) ([]storage.Message, error)
 	GetMessagesFromDate(ctx context.Context, channel string, startDate time.Time) error
 	GetMessagesInDateRange(ctx context.Context, channel string, startDate time.Time, endDate time.Time) error
 	SubscribeToChannel(ctx context.Context, channel string) (<-chan storage.Message, error)
@@ -122,7 +122,7 @@ func (c *Client) GetLastMessages(ctx context.Context, channel string, limit int)
 	log.Printf("Режим отладки: Получение последних %d сообщений из канала %s (без сохранения в БД)...", limit, channelName)
 
 	// Для GetLastMessages в режиме отладки нам не нужен dbChannel.ID для parseMessage, т.к. не сохраняем в БД. Создадим "пустой" UUID.
-	dummyChannelID := uuid.Nil
+	dummyChannelID := int64(0)
 
 	channelPeer, err := c.resolveChannelPeer(ctx, channelName)
 	if err != nil {
@@ -223,7 +223,7 @@ func (c *Client) GetMessagesFromDate(ctx context.Context, channel string, startD
 	}
 	if dbChannel == nil {
 		dbChannel = &storage.Channel{
-			ID:        uuid.New(),
+			ID:        0,
 			Username:  channelName,
 			Title:     sql.NullString{String: channelName, Valid: true},
 			CreatedAt: time.Now(),
@@ -365,7 +365,7 @@ func (c *Client) GetMessagesInDateRange(ctx context.Context, channel string, sta
 	}
 	if dbChannel == nil {
 		dbChannel = &storage.Channel{
-			ID:        uuid.New(),
+			ID:        0,
 			Username:  channelName,
 			Title:     sql.NullString{String: channelName, Valid: true},
 			CreatedAt: time.Now(),
@@ -570,7 +570,7 @@ func (c *Client) SubscribeToChannel(ctx context.Context, channelName string) (<-
 	}
 	if dbChannel == nil {
 		dbChannel = &storage.Channel{
-			ID:        uuid.New(),
+			ID:        0,
 			Username:  channelName,
 			Title:     sql.NullString{String: channelName, Valid: true},
 			CreatedAt: time.Now(),
@@ -671,7 +671,7 @@ func (c *Client) auth(ctx context.Context) error {
 }
 
 // parseMessage парсит сообщение из MTProto в нашу структуру storage.Message
-func (c *Client) parseMessage(msg tg.MessageClass, channelID uuid.UUID, channelName string) (storage.Message, error) {
+func (c *Client) parseMessage(msg tg.MessageClass, channelID int64, channelName string) (storage.Message, error) {
 	var text string
 	var isForward bool
 	var senderUsername sql.NullString
@@ -704,7 +704,7 @@ func (c *Client) parseMessage(msg tg.MessageClass, channelID uuid.UUID, channelN
 	}
 
 	return storage.Message{
-		ID:             uuid.New(),
+		ID:             0,
 		TelegramID:     int64(msg.GetID()),
 		ChannelID:      channelID,
 		Text:           sql.NullString{String: text, Valid: text != ""},
