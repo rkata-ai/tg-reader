@@ -50,7 +50,7 @@ func main() {
 		log.Fatalf("Failed to create Postgres storage: %v", err)
 	}
 
-	store.Migrate(context.Background())
+//	store.Migrate(context.Background())
 
 	defer func() {
 		if err := store.Close(); err != nil {
